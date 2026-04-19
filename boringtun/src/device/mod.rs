@@ -55,6 +55,74 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 const MAX_ITR: usize = 100; // Number of packets to handle per handler call
 
+#[derive(Clone, Debug)]
+pub enum SocketContext {
+    V4(libc::in_pktinfo),
+    V6(libc::in6_pktinfo),
+}
+
+pub fn send_with_ctx(
+    sock: &socket2::Socket,
+    buf: &[u8],
+    addr: &socket2::SockAddr,
+    ctx: Option<&SocketContext>,
+) -> io::Result<usize> {
+    use nix::sys::socket::{self, ControlMessage, MsgFlags};
+    use socket2::SockAddr;
+    use std::io::{self, IoSlice};
+
+    let iov = [IoSlice::new(buf)];
+
+    let bytes_sent = match addr.as_socket() {
+        Some(std::net::SocketAddr::V4(v4)) => {
+            let dest = socket::SockaddrIn::from(v4);
+            match ctx {
+                Some(SocketContext::V4(info)) => socket::sendmsg(
+                    sock.as_raw_fd(),
+                    &iov,
+                    &[ControlMessage::Ipv4PacketInfo(info)],
+                    MsgFlags::empty(),
+                    Some(&dest),
+                ),
+                None => socket::sendmsg(sock.as_raw_fd(), &iov, &[], MsgFlags::empty(), Some(&dest)),
+                Some(SocketContext::V6(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Mismatched IPv4 address and IPv6 context",
+                    ))
+                }
+            }
+        }
+        Some(std::net::SocketAddr::V6(v6)) => {
+            let dest = socket::SockaddrIn6::from(v6);
+            match ctx {
+                Some(SocketContext::V6(info)) => socket::sendmsg(
+                    sock.as_raw_fd(),
+                    &iov,
+                    &[ControlMessage::Ipv6PacketInfo(info)],
+                    MsgFlags::empty(),
+                    Some(&dest),
+                ),
+                None => socket::sendmsg(sock.as_raw_fd(), &iov, &[], MsgFlags::empty(), Some(&dest)),
+                Some(SocketContext::V4(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Mismatched IPv6 address and IPv4 context",
+                    ))
+                }
+            }
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Address must be a valid IPv4 or IPv6 address",
+            ))
+        }
+    }?;
+
+    Ok(bytes_sent)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("i/o error: {0}")]
@@ -430,6 +498,8 @@ impl Device {
         udp_sock4.set_reuse_address(true)?;
         udp_sock4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
         udp_sock4.set_nonblocking(true)?;
+        nix::sys::socket::setsockopt(udp_sock4.as_raw_fd(), nix::sys::socket::sockopt::Ipv4PacketInfo, &true)
+            .map_err(|errno| Error::SetSockOpt(format!("Failed to enable Ipv4PacketInfo on udp_sock4: {:?}", errno)))?;
 
         if port == 0 {
             // Random port was assigned
@@ -440,6 +510,8 @@ impl Device {
         udp_sock6.set_reuse_address(true)?;
         udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
         udp_sock6.set_nonblocking(true)?;
+        nix::sys::socket::setsockopt(udp_sock6.as_raw_fd(), nix::sys::socket::sockopt::Ipv6RecvPacketInfo, &true)
+            .map_err(|errno| Error::SetSockOpt(format!("Failed to enable Ipv6RecvPacketInfo on udp_sock4: {:?}", errno)))?;
 
         self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
         self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
@@ -558,10 +630,10 @@ impl Device {
                         TunnResult::WriteToNetwork(packet) => {
                             match endpoint_addr {
                                 SocketAddr::V4(_) => {
-                                    udp4.send_to(packet, &endpoint_addr.into()).ok()
+                                    send_with_ctx(udp4, packet, &endpoint_addr.into(), p.endpoint().ctx.as_ref()).ok()
                                 }
                                 SocketAddr::V6(_) => {
-                                    udp6.send_to(packet, &endpoint_addr.into()).ok()
+                                    send_with_ctx(udp6, packet, &endpoint_addr.into(), p.endpoint().ctx.as_ref()).ok()
                                 }
                             };
                         }
@@ -601,22 +673,96 @@ impl Device {
                 let rate_limiter = d.rate_limiter.as_ref().unwrap();
 
                 // Loop while we have packets on the anonymous connection
+                let mut cmsg_buffer = vec![
+                    0;
+                    std::cmp::max(
+                        unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as libc::c_uint) as usize },
+                        unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as libc::c_uint) as usize },
+                    )
+                ];
 
-                // Safety: the `recv_from` implementation promises not to write uninitialised
-                // bytes to the buffer, so this casting is safe.
-                let src_buf =
-                    unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
-                while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
+                loop {
+                    let mut iov = [std::io::IoSliceMut::new(&mut t.src_buf[..])];
+
+                    let (packet_len, addr, socket_ctx) = match udp.domain() {
+                        Ok(Domain::IPV4) => {
+                            let msg = match nix::sys::socket::recvmsg::<nix::sys::socket::SockaddrIn>(
+                                udp.as_raw_fd(),
+                                &mut iov,
+                                Some(&mut cmsg_buffer),
+                                nix::sys::socket::MsgFlags::empty(),
+                            ) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    // TODO: fix error handling!
+                                    eprintln!("recvmsg error: {}", e);
+                                    break;
+                                }
+                            };
+
+                            let Some(address) = msg.address else {
+                                eprintln!("Failed to get adress from socket");
+                                break;
+                            };
+
+                            let ctx = msg.cmsgs().find_map(|cmsg| {
+                                if let nix::sys::socket::ControlMessageOwned::Ipv4PacketInfo(pktinfo) = cmsg {
+                                    Some(SocketContext::V4(pktinfo))
+                                } else {
+                                    None
+                                }
+                            });
+
+                            (msg.bytes, SocketAddr::new(IpAddr::V4(Ipv4Addr::from_bits(address.ip())), address.port()), ctx)
+                        },
+
+                        Ok(Domain::IPV6) => {
+                            let msg = match nix::sys::socket::recvmsg::<nix::sys::socket::SockaddrIn6>(
+                                udp.as_raw_fd(),
+                                &mut iov,
+                                Some(&mut cmsg_buffer),
+                                nix::sys::socket::MsgFlags::empty(),
+                            ) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    // TODO: fix error handling!
+                                    eprintln!("recvmsg error: {}", e);
+                                    break;
+                                }
+                            };
+
+                            let Some(address) = msg.address else {
+                                eprintln!("Failed to get adress from socket");
+                                break;
+                            };
+
+                            let ctx = msg.cmsgs().find_map(|cmsg| {
+                                if let nix::sys::socket::ControlMessageOwned::Ipv6PacketInfo(pktinfo) = cmsg {
+                                    Some(SocketContext::V6(pktinfo))
+                                } else {
+                                    None
+                                }
+                            });
+
+                            (msg.bytes, SocketAddr::new(IpAddr::V6(address.ip()), address.port()), ctx)
+                        },
+
+                        other => {
+                            eprintln!("Unexpected socket domain: {:?}", other);
+                            break;
+                        },
+                    };
+
                     let packet = &t.src_buf[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet = match rate_limiter.verify_packet(
-                        Some(addr.as_socket().unwrap().ip()),
+                        Some(addr.ip()),
                         packet,
                         &mut t.dst_buf,
                     ) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie)) => {
-                            let _: Result<_, _> = udp.send_to(cookie, &addr);
+                            let _: Result<_, _> = send_with_ctx(&udp, cookie, &addr.into(), socket_ctx.as_ref());
                             continue;
                         }
                         Err(_) => continue,
@@ -652,7 +798,7 @@ impl Device {
                         TunnResult::Err(_) => continue,
                         TunnResult::WriteToNetwork(packet) => {
                             flush = true;
-                            let _: Result<_, _> = udp.send_to(packet, &addr);
+                            let _: Result<_, _> = send_with_ctx(&udp, packet, &addr.into(), socket_ctx.as_ref());
                         }
                         TunnResult::WriteToTunnelV4(packet, addr) => {
                             if p.is_allowed_ip(addr) {
@@ -671,14 +817,13 @@ impl Device {
                         while let TunnResult::WriteToNetwork(packet) =
                             p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
                         {
-                            let _: Result<_, _> = udp.send_to(packet, &addr);
+                            let _: Result<_, _> = send_with_ctx(&udp, packet, &addr.into(), socket_ctx.as_ref());
                         }
                     }
 
                     // This packet was OK, that means we want to create a connected socket for this peer
-                    let addr = addr.as_socket().unwrap();
                     let ip_addr = addr.ip();
-                    p.set_endpoint(addr);
+                    p.set_endpoint(addr, socket_ctx);
                     if d.config.use_connected_socket {
                         if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
                             d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
@@ -815,11 +960,12 @@ impl Device {
                             let mut endpoint = peer.endpoint_mut();
                             if let Some(conn) = endpoint.conn.as_mut() {
                                 // Prefer to send using the connected socket
-                                let _: Result<_, _> = conn.write(packet);
+                                panic!("Connected socket unsupported");
+                                //let _: Result<_, _> = conn.write(packet);
                             } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                                let _: Result<_, _> = udp4.send_to(packet, &addr.into());
+                                let _: Result<_, _> = send_with_ctx(udp4, packet, &addr.into(), endpoint.ctx.as_ref());
                             } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                                let _: Result<_, _> = udp6.send_to(packet, &addr.into());
+                                let _: Result<_, _> = send_with_ctx(udp6, packet, &addr.into(), endpoint.ctx.as_ref());
                             } else {
                                 tracing::error!("No endpoint");
                             }

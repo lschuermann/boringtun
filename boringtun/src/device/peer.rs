@@ -10,10 +10,13 @@ use std::str::FromStr;
 use crate::device::{AllowedIps, Error};
 use crate::noise::{Tunn, TunnResult};
 
+use super::SocketContext;
+
 #[derive(Default, Debug)]
 pub struct Endpoint {
     pub addr: Option<SocketAddr>,
     pub conn: Option<socket2::Socket>,
+    pub ctx: Option<SocketContext>,
 }
 
 pub struct Peer {
@@ -64,6 +67,7 @@ impl Peer {
             endpoint: RwLock::new(Endpoint {
                 addr: endpoint,
                 conn: None,
+                ctx: None,
             }),
             allowed_ips: allowed_ips.iter().map(|ip| (ip, ())).collect(),
             preshared_key,
@@ -89,7 +93,7 @@ impl Peer {
         }
     }
 
-    pub fn set_endpoint(&self, addr: SocketAddr) {
+    pub fn set_endpoint(&self, addr: SocketAddr, ctx: Option<SocketContext>) {
         let mut endpoint = self.endpoint.write();
         if endpoint.addr != Some(addr) {
             // We only need to update the endpoint if it differs from the current one
@@ -98,6 +102,7 @@ impl Peer {
             }
 
             endpoint.addr = Some(addr);
+            endpoint.ctx = ctx;
         }
     }
 
